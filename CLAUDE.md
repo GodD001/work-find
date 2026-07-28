@@ -110,6 +110,7 @@ concurrency:
 - **第一层 — 行哈希完全相同 → 合并**。语义是"同一条数据在快照里出现了两次"。
 - **第二层 — `fallback_key = (normalize(company), normalize(role))` 相同 → 合并**，但有三条约束：
   - a. 只在都属于第 3 类（既无 `application_url` 也无显式 job ID）的记录之间生效。第 1 类（有 URL）和第 2 类（有 job ID）不参与第二层。
+    - a 附加约束：还要求两条记录的 `source_repo` 相同。`fallback_key` 本身只是 `(normalize(company), normalize(role))`，不含 `source_repo`；但第 3 类 `canonical_id` 本来就是 `source_repo + 行哈希` 派生的——两个不同来源仓库凑巧 company+role+location+date 全同，不构成"是同一行原始数据换了个措辞"的证据（充其量是同一个真实岗位被两个仓库分别转载，那是另一个问题，不在这条规则的适用范围内）。跨 run 复用 `fallback_key` 索引（见下文"跨 run 稳定性"）同样要求 `source_repo` 匹配。
   - b. 若两条记录的 `location` 或 `date_posted_raw` 不同，不合并。这两个字段是原文保留、未 normalize 的，能区分"同公司同职位的不同岗位"；而哈希漂移场景（上游改一个 emoji）下这两个字段通常不变。
   - c. 第二层只作用于第一层的产出，不回头重新分组。
 
@@ -150,7 +151,7 @@ concurrency:
   1. `canonical_id` 直接命中 `seen_jobs` 的 key → 老岗位，只更新 `last_seen_at`。
   2. `canonical_id` 命中某条记录的 `merged_ids`（别名索引，O(1)）→ 老岗位，只更新 `last_seen_at`，**不**再次追加进 `merged_ids`、**不**递增 `merged_row_count`、**不**再写审计日志——因为这是同一个历史 loser id 的重复出现，不是新发现的重复行。
   3. 前两关都没命中，才查 `fallback_key`（+ `location` + `date_posted_raw` + `source_repo`）索引 → 命中则视为**新发现的** loser id：把它追加进 winner 的 `merged_ids`、`merged_row_count` 按这次抓取贡献的原始行数（可能 >1，见下）累加、写一条 `reason: "fallback_key_cross_run"` 的审计日志。命中后立即把这个 loser id 也登记进内存里的别名索引，保证本次运行内它再出现时直接走第 2 关。
-- **第二层合并额外要求 `source_repo` 相同**：`fallback_key` 官方定义是 `(normalize(company), normalize(role))`，本身不含 `source_repo`。但第 3 类 `canonical_id` 本来就是 `source_repo + 行哈希` 派生的，两个不同来源仓库凑巧 company+role+location+date 全同，不构成"是同一行原始数据换了个措辞"的证据（充其量是同一个真实岗位被两个仓库分别转载，那是另一个问题，不在 D-3 的适用范围内）。所以 `deduplicate.py` 的第二层聚类键和跨 run 索引键都额外带上 `source_repo`，比 CLAUDE.md 原文的三条约束更保守。
+- `source_repo` 也必须匹配才能合并/复用别名，见上文约束 a 附加约束——`deduplicate.py` 的第二层聚类键和跨 run 索引键都带上了 `source_repo`。
 - **审计日志的 `merged_count` 必须用真实累计值，不能假设起点是 1**：一次抓取内某个 winner 自己就可能已经吸收了同批次的多行（`merge_duplicates` 返回的批内计数），如果这个 winner 这次又通过 `fallback_key` 匹配到历史上的另一个 winner，贡献给历史 winner 的行数是它**这一批的全部计数**，不是笼统的 `+1`；同理它自己在本批合并掉的那些 loser id，也要一并追加进历史 winner 的 `merged_ids`，不能只记它自己的 id。算错这个数字，审计日志就失去了"回头核对合并对不对"的意义。
 
 ---
