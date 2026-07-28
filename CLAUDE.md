@@ -141,6 +141,18 @@ concurrency:
 
 理由：第 3 类兜底的合并是不可逆的静默丢弃——两行一旦判定为同一岗位，被合并掉的那条再也不会单独出现在邮件或 `job_history.jsonl` 里。如果从不记录，你永远没有机会发现某次合并其实是误判（比如两个不同岗位凑巧 company+role 完全一样）。有了日志，某天发现漏了个岗位时才能回头查是不是被这条规则吃掉的。
 
+#### D-3 补充：merged_ids 可追溯映射（deduplicate.py 实现细节）
+
+> 本节是 `deduplicate.py` 落地时补的实现细节，解决"合并后 loser_id 下次运行哈希兜底会重新生成它"的问题——loser 的 `canonical_id` 是 `source_repo + 原始行哈希` 的确定性函数，同一行原文不变，未来任何一次重新抓取都会重新算出同一个 loser id；如果只记录 winner、不记录这层映射，每次重新算出的 loser id 都得重新走一遍"跨 run fallback_key 查找"才能认出它是旧岗位。
+
+- `seen_jobs.json` 里每条第 3 类（`hash_fallback`）记录额外存 `merged_ids: list[str]`——历史上（不区分是同一次抓取内的第一层/第二层合并，还是跨 run 命中 `fallback_key`）曾经折叠进这个 winner 的所有 loser `canonical_id`。
+- 新抓到的第 3 类记录按顺序过三关，**任意一关命中就停止**，不再往下查：
+  1. `canonical_id` 直接命中 `seen_jobs` 的 key → 老岗位，只更新 `last_seen_at`。
+  2. `canonical_id` 命中某条记录的 `merged_ids`（别名索引，O(1)）→ 老岗位，只更新 `last_seen_at`，**不**再次追加进 `merged_ids`、**不**递增 `merged_row_count`、**不**再写审计日志——因为这是同一个历史 loser id 的重复出现，不是新发现的重复行。
+  3. 前两关都没命中，才查 `fallback_key`（+ `location` + `date_posted_raw` + `source_repo`）索引 → 命中则视为**新发现的** loser id：把它追加进 winner 的 `merged_ids`、`merged_row_count` 按这次抓取贡献的原始行数（可能 >1，见下）累加、写一条 `reason: "fallback_key_cross_run"` 的审计日志。命中后立即把这个 loser id 也登记进内存里的别名索引，保证本次运行内它再出现时直接走第 2 关。
+- **第二层合并额外要求 `source_repo` 相同**：`fallback_key` 官方定义是 `(normalize(company), normalize(role))`，本身不含 `source_repo`。但第 3 类 `canonical_id` 本来就是 `source_repo + 行哈希` 派生的，两个不同来源仓库凑巧 company+role+location+date 全同，不构成"是同一行原始数据换了个措辞"的证据（充其量是同一个真实岗位被两个仓库分别转载，那是另一个问题，不在 D-3 的适用范围内）。所以 `deduplicate.py` 的第二层聚类键和跨 run 索引键都额外带上 `source_repo`，比 CLAUDE.md 原文的三条约束更保守。
+- **审计日志的 `merged_count` 必须用真实累计值，不能假设起点是 1**：一次抓取内某个 winner 自己就可能已经吸收了同批次的多行（`merge_duplicates` 返回的批内计数），如果这个 winner 这次又通过 `fallback_key` 匹配到历史上的另一个 winner，贡献给历史 winner 的行数是它**这一批的全部计数**，不是笼统的 `+1`；同理它自己在本批合并掉的那些 loser id，也要一并追加进历史 winner 的 `merged_ids`，不能只记它自己的 id。算错这个数字，审计日志就失去了"回头核对合并对不对"的意义。
+
 ---
 
 ## 目录结构
