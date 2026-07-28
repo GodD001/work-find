@@ -1,0 +1,29 @@
+{# daily.txt.j2 — AI 职位雷达日报，纯文本部分。
+
+同 daily.html.j2 的事实约束（见该文件顶部注释 / emailer.py 模块注释）：
+location、date_posted_raw 原样输出（含任何 </br>/<details> 标签，作为
+普通文本字符，不解析不转义）；application_url 为空只显示"无申请链接"；
+is_closed 只反映来源的 🔒 标记。
+#}
+AI 职位雷达 · {{ now.strftime('%Y-%m-%d') }}
+{% if stats.ai_ranking_unavailable %}
+⚠️ AI 排序不可用，本次为关键词打分（降级路径，见 CLAUDE.md AI 调用约束）
+{% endif %}
+本次新增 {{ stats.new_count }} ／ 本次推送 {{ sent_count }} ／ 队列积压 {{ stats.backlog_count }}
+{% if stats.missing_sources %}
+以下来源本次抓取失败，结果可能不完整：{{ stats.missing_sources | join('、') }}
+{% endif %}
+{% for job in jobs %}
+- {{ job.company }} / {{ job.role }}
+  Location: {{ job.location }}
+  Posted: {{ job.date_posted_raw }}
+  Score: {{ job.fit_score if job.fit_score is not none else '—' }}
+  Link: {% if job.application_url %}{{ job.application_url }}{% else %}无申请链接{% endif %}
+  {% if job.is_closed %}Status: 🔒 已关闭
+  {% endif %}
+  {% if job.ranking %}
+  匹配依据：{{ job.ranking.matching_evidence | join('；') }}
+  {% if job.ranking.explicit_risks %}风险提示：{{ job.ranking.explicit_risks | join('；') }}
+  {% endif %}
+  {% endif %}
+{% endfor %}

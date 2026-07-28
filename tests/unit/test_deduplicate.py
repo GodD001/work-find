@@ -118,6 +118,8 @@ def make_seen_entry(
         first_seen_at=first_seen_at,
         last_seen_at=last_seen_at or first_seen_at,
         sent_at=sent_at,
+        application_url=job.application_url,
+        is_closed=job.is_closed,
     )
 
 
@@ -347,6 +349,25 @@ def test_reconcile_adds_genuinely_new_record_with_sent_at_none_and_fit_score_non
     assert entry.last_seen_at == T1
 
 
+def test_reconcile_new_record_captures_application_url_and_is_closed():
+    """A backlog entry may not get emailed until days after it's first
+    fetched, by which point the original Job/source page is gone — these
+    fields must be captured now or emailer.py has nothing to render a link
+    or closed-badge from for anything that wasn't sent same-day."""
+    job = make_job(
+        company="Acme",
+        role="SWE Intern",
+        application_url="https://acme.example/apply",
+        application_url_raw="https://acme.example/apply?utm_source=x",
+        is_closed=True,
+    )
+    result = reconcile({}, [job], now=T1)
+
+    entry = result.store[job.canonical_id]
+    assert entry.application_url == "https://acme.example/apply"
+    assert entry.is_closed is True
+
+
 def test_apply_fit_scores_writes_scores_for_new_ids_only():
     job = make_job(company="Acme", role="SWE Intern")
     result = reconcile({}, [job], now=T1)
@@ -537,6 +558,21 @@ def test_bootstrap_writes_all_records_with_sent_at_bootstrap_and_no_fit_score():
         assert entry.fit_score is None
         assert entry.first_seen_at == T1
         assert entry.last_seen_at == T1
+
+
+def test_bootstrap_captures_application_url_and_is_closed():
+    job = make_job(
+        company="Acme",
+        role="SWE Intern",
+        application_url="https://acme.example/apply",
+        application_url_raw="https://acme.example/apply",
+        is_closed=True,
+    )
+    store, _events = bootstrap([job], now=T1)
+
+    entry = store[job.canonical_id]
+    assert entry.application_url == "https://acme.example/apply"
+    assert entry.is_closed is True
 
 
 def test_bootstrap_applies_dedup_merging_before_writing():

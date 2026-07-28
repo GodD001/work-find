@@ -1,0 +1,84 @@
+{# daily.html.j2 — AI 职位雷达日报，HTML 部分。
+
+渲染层的事实约束（CLAUDE.md 铁律1 延伸，见 emailer.py 模块注释）：
+  - location 原样字符串，可能含 </br> 和 <details> 标签，是来源本身的 HTML
+    片段，不是本系统生成的——唯一标记 |safe（不转义）的字段，让它按 HTML
+    渲染（折叠/换行），不拆分成数组、不猜"主地点"。
+  - date_posted_raw 原样输出，不补年份、不转换成"N 天前"。
+  - application_url 为 null 时显示"无申请链接"，绝不回退到任何 GitHub 链接
+    ——本模板压根不知道、也不引用源仓库的行链接。
+  - is_closed 只用于是否显示"已关闭"徽章，只反映来源自己的 🔒 标记
+    （在 SeenJobEntry 写入时就已经独立判定好，这里只读不推断）。
+  - company/role 等其余字段是任意抓取文本，未做安全性保证，正常转义。
+#}
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>{{ subject }}</title>
+</head>
+<body style="font-family: sans-serif; color: #222;">
+  <h1>AI 职位雷达 · {{ now.strftime('%Y-%m-%d') }}</h1>
+
+  {% if stats.ai_ranking_unavailable %}
+  <p style="background:#fee2e2;border:1px solid #dc2626;padding:10px;font-weight:bold;">
+    ⚠️ AI 排序不可用，本次为关键词打分（降级路径，见 CLAUDE.md AI 调用约束）
+  </p>
+  {% endif %}
+
+  <p>
+    本次新增 {{ stats.new_count }} ／
+    本次推送 {{ sent_count }} ／
+    队列积压 {{ stats.backlog_count }}
+  </p>
+
+  {% if stats.missing_sources %}
+  <p style="color:#dc2626;">
+    以下来源本次抓取失败，结果可能不完整：{{ stats.missing_sources | join('、') }}
+  </p>
+  {% endif %}
+
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+    <thead>
+      <tr>
+        <th>Company</th>
+        <th>Role</th>
+        <th>Location</th>
+        <th>Posted</th>
+        <th>Score</th>
+        <th>Link</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td>{{ job.company }}</td>
+        <td>{{ job.role }}</td>
+        <td>{{ job.location | safe }}</td>
+        <td>{{ job.date_posted_raw }}</td>
+        <td>{{ job.fit_score if job.fit_score is not none else '—' }}</td>
+        <td>
+          {% if job.application_url %}
+          <a href="{{ job.application_url }}">申请链接</a>
+          {% else %}
+          无申请链接
+          {% endif %}
+        </td>
+        <td>{% if job.is_closed %}🔒 已关闭{% endif %}</td>
+      </tr>
+      {% if job.ranking %}
+      <tr>
+        <td colspan="7" style="background:#f8fafc;">
+          <strong>匹配依据：</strong>{{ job.ranking.matching_evidence | join('；') }}
+          {% if job.ranking.explicit_risks %}
+          <br><strong>风险提示：</strong>{{ job.ranking.explicit_risks | join('；') }}
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>

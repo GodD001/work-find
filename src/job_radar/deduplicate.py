@@ -102,6 +102,18 @@ class SeenJobEntry:
     rebuild the fallback_key index without re-deriving normalize() results —
     freezing them at write time also means a future change to normalize's
     text-cleaning rules can't retroactively shift an existing index entry.
+
+    `application_url`/`is_closed` are stored for the same structural reason:
+    a backlog entry may not get emailed until days after it was first
+    fetched, by which point the original `Job` object (and the source page
+    it came from) is gone — emailer.py has nothing else to render a link or
+    a closed-badge from. Like every other fact field here, both are frozen
+    at first sight and never refreshed on a later `reconcile` sighting of
+    the same canonical_id (same policy already applied to company/role/
+    location/date_posted_raw and fit_score — see docs/open-questions.md
+    OQ-1). Defaulted so pre-existing construction call sites (this module's
+    own tests, tests/integration/test_overflow_queue.py's synthetic fixtures)
+    don't need to change.
     """
 
     canonical_id: str
@@ -118,6 +130,8 @@ class SeenJobEntry:
     first_seen_at: str
     last_seen_at: str
     sent_at: str | None
+    application_url: str | None = None
+    is_closed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -134,6 +148,8 @@ class SeenJobEntry:
             "first_seen_at": self.first_seen_at,
             "last_seen_at": self.last_seen_at,
             "sent_at": self.sent_at,
+            "application_url": self.application_url,
+            "is_closed": self.is_closed,
         }
 
     @classmethod
@@ -154,6 +170,8 @@ class SeenJobEntry:
             first_seen_at=data["first_seen_at"],
             last_seen_at=data["last_seen_at"],
             sent_at=data["sent_at"],
+            application_url=data.get("application_url"),
+            is_closed=data.get("is_closed", False),
         )
 
 
@@ -414,6 +432,8 @@ def reconcile(
             first_seen_at=now,
             last_seen_at=now,
             sent_at=None,
+            application_url=job.application_url,
+            is_closed=job.is_closed,
         )
         new_store[job.canonical_id] = entry
         new_ids.append(job.canonical_id)
@@ -460,6 +480,8 @@ def bootstrap(jobs: list[Job], *, now: str) -> tuple[SeenStore, list[MergeEvent]
             first_seen_at=now,
             last_seen_at=now,
             sent_at=BOOTSTRAP_SENT_AT,
+            application_url=job.application_url,
+            is_closed=job.is_closed,
         )
     return store, merge_result.events
 
