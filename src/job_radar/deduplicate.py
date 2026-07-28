@@ -170,14 +170,28 @@ class MergeResult:
     winners: list[Job]
     events: list[MergeEvent]
     merge_counts: dict[str, int]  # winner canonical_id -> total raw rows merged (this batch)
-    merged_ids: dict[str, list[str]] = field(default_factory=dict)  # winner -> loser ids (layer 2 only)
+    # winner canonical_id -> loser ids folded into it (layer 2 only)
+    merged_ids: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _cluster_key(job: Job) -> tuple[str, tuple[str, str], str, str]:
     # source_repo is included even though CLAUDE.md's fallback_key definition
     # doesn't mention it — see CLAUDE.md D-3 "补充：merged_ids 可追溯映射" for
     # why this module requires source_repo to also match.
-    return (job.source_repo, compute_fallback_key(job.company, job.role), job.location, job.date_posted_raw)
+    return (
+        job.source_repo,
+        compute_fallback_key(job.company, job.role),
+        job.location,
+        job.date_posted_raw,
+    )
+
+
+def _entry_fk_key(entry: SeenJobEntry) -> tuple[str, tuple[str, str], str, str]:
+    """Same shape as `_cluster_key`, but reading an already-computed
+    `SeenJobEntry.fallback_key` instead of recomputing it from company/role —
+    used to index/query `store` entries during cross-run reconciliation."""
+    assert entry.fallback_key is not None
+    return (entry.source_repo, entry.fallback_key, entry.location, entry.date_posted_raw)
 
 
 def merge_duplicates(jobs: list[Job], *, now: str) -> MergeResult:
@@ -323,7 +337,7 @@ def reconcile(
     fk_index: dict[tuple, str] = {}
     for cid, entry in store.items():
         if entry.canonical_id_tier == "hash_fallback" and entry.fallback_key is not None:
-            fk_index[(entry.source_repo, entry.fallback_key, entry.location, entry.date_posted_raw)] = cid
+            fk_index[_entry_fk_key(entry)] = cid
 
     for job in winners:
         if job.canonical_id in new_store:
@@ -404,9 +418,7 @@ def reconcile(
         new_store[job.canonical_id] = entry
         new_ids.append(job.canonical_id)
         if entry.canonical_id_tier == "hash_fallback" and entry.fallback_key is not None:
-            fk_index[(entry.source_repo, entry.fallback_key, entry.location, entry.date_posted_raw)] = (
-                job.canonical_id
-            )
+            fk_index[_entry_fk_key(entry)] = job.canonical_id
 
     return ReconcileResult(store=new_store, new_ids=new_ids, events=events)
 

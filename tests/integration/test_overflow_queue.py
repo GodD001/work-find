@@ -56,6 +56,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from job_radar.deduplicate import (
+    SeenJobEntry,
+    apply_fit_scores,
+    mark_sent,
+    pending_count,
+    reconcile,
+    select_for_send,
+)
+from job_radar.models import Job
+
 CAP = 80
 T1 = datetime(2026, 7, 28, 1, 30, tzinfo=timezone.utc)
 T2 = T1 + timedelta(days=1)
@@ -89,6 +99,64 @@ class RecordingEmailer:
         return self.should_succeed
 
 
+def _to_job(record: JobRecord) -> Job:
+    """Adapt this test file's minimal JobRecord into a full Job.
+
+    Tagged canonical_id_tier="url" (with a synthetic application_url derived
+    from the test's own canonical_id) specifically so D-3's fallback_key
+    merge machinery — irrelevant to what this suite locks down — never
+    triggers on these fixtures' repeated company/role text (make_flat_batch
+    reuses "Acme"/"SWE Intern" across every record; under tier="hash_fallback"
+    that would make deduplicate.merge_duplicates collapse them into one).
+    """
+    url = f"https://internal.test/{record.canonical_id}"
+    return Job(
+        source_repo="test",
+        company=record.company,
+        role=record.role,
+        location="",
+        date_posted_raw="",
+        application_url=url,
+        application_url_raw=url,
+        source_job_id=None,
+        is_closed=False,
+        offers_sponsorship=None,
+        requires_us_citizenship=None,
+        raw_row_hash="n/a",
+        canonical_id=record.canonical_id,
+        canonical_id_tier="url",
+    )
+
+
+def _seen_entry_to_dedup(cid: str, e: SeenEntry) -> SeenJobEntry:
+    return SeenJobEntry(
+        canonical_id=cid,
+        canonical_id_tier="url",
+        source_repo="test",
+        company=e.company,
+        role=e.role,
+        location="",
+        date_posted_raw="",
+        fallback_key=None,
+        merged_ids=[],
+        merged_row_count=1,
+        fit_score=e.fit_score,
+        first_seen_at=e.first_seen_at.isoformat(),
+        last_seen_at=e.first_seen_at.isoformat(),
+        sent_at=e.sent_at.isoformat() if e.sent_at else None,
+    )
+
+
+def _dedup_entry_to_seen(entry: SeenJobEntry) -> SeenEntry:
+    return SeenEntry(
+        company=entry.company,
+        role=entry.role,
+        fit_score=entry.fit_score,
+        first_seen_at=datetime.fromisoformat(entry.first_seen_at),
+        sent_at=datetime.fromisoformat(entry.sent_at) if entry.sent_at else None,
+    )
+
+
 def run_cycle(
     seen_jobs: dict[str, SeenEntry],
     fetched_records: list[JobRecord],
@@ -96,42 +164,59 @@ def run_cycle(
     now: datetime,
     cap: int = CAP,
 ) -> tuple[dict[str, SeenEntry], dict[str, int]]:
-    new_records = [r for r in fetched_records if r.canonical_id not in seen_jobs]
-    backlog_ids = [cid for cid, e in seen_jobs.items() if e.sent_at is None]
+    """Thin adapter over job_radar.deduplicate's real reconcile /
+    select_for_send / mark_sent. daily.py (implementation step 6) doesn't
+    exist yet, so this adapter is the orchestration stand-in until then —
+    every bit of sorting/selection/state-write logic that used to be
+    reimplemented in this file has been deleted; this function only
+    translates between this test file's minimal fixtures and the real
+    module's types, and sequences the three real calls the same way
+    daily.py eventually will (see job_radar.deduplicate's module docstring).
+    """
+    now_iso = now.isoformat()
+    backlog_before = sum(1 for e in seen_jobs.values() if e.sent_at is None)
 
-    candidates: list[tuple[str, datetime, int, JobRecord]] = []
-    for r in new_records:
-        candidates.append((r.canonical_id, now, r.fit_score, r))
-    for cid in backlog_ids:
-        e = seen_jobs[cid]
-        candidates.append(
-            (cid, e.first_seen_at, e.fit_score, JobRecord(cid, e.company, e.role, e.fit_score))
+    store = {cid: _seen_entry_to_dedup(cid, e) for cid, e in seen_jobs.items()}
+    winners = [_to_job(r) for r in fetched_records]
+
+    reconcile_result = reconcile(store, winners, now=now_iso)
+    reconciled_store = reconcile_result.store
+    new_ids = reconcile_result.new_ids
+
+    # Stand-in for the (not-yet-built) ranker: this test's fixtures already
+    # carry a deterministic fit_score directly on JobRecord (see docstring
+    # section B) — apply_fit_scores only ever touches genuinely new ids, per
+    # CLAUDE.md's AI 调用约束 (batch scoring only new records, never backlog).
+    scores_by_id = {r.canonical_id: r.fit_score for r in fetched_records}
+    reconciled_store = apply_fit_scores(reconciled_store, {cid: scores_by_id[cid] for cid in new_ids})
+
+    stats = {"new": len(new_ids), "backlog_before": backlog_before}
+
+    selected_ids = select_for_send(reconciled_store, cap=cap)
+    if not selected_ids:
+        return seen_jobs, {**stats, "sent": 0, "backlog": backlog_before}
+
+    batch = [
+        JobRecord(
+            cid,
+            reconciled_store[cid].company,
+            reconciled_store[cid].role,
+            reconciled_store[cid].fit_score,
         )
-
-    # 三级键：first_seen_at ASC → fit_score DESC → canonical_id ASC
-    candidates.sort(key=lambda c: (c[1], -c[2], c[0]))
-    selected = candidates[:cap]
-    selected_ids = {c[0] for c in selected}
-    stats = {"new": len(new_records), "backlog_before": len(backlog_ids)}
-
-    if not selected:
-        return seen_jobs, {**stats, "sent": 0, "backlog": len(backlog_ids)}
-
-    success = emailer.send([c[3] for c in selected])
+        for cid in selected_ids
+    ]
+    success = emailer.send(batch)
     if not success:
-        return seen_jobs, {**stats, "sent": 0, "backlog": len(backlog_ids)}
+        # CLAUDE.md 铁律2: email failed -> this run writes nothing, not even
+        # first_seen_at for brand-new records. Discard reconciled_store
+        # entirely and return the caller's original, untouched seen_jobs.
+        return seen_jobs, {**stats, "sent": 0, "backlog": backlog_before}
 
-    updated = dict(seen_jobs)
-    for r in new_records:
-        sent_at = now if r.canonical_id in selected_ids else None
-        updated[r.canonical_id] = SeenEntry(r.company, r.role, r.fit_score, now, sent_at)
-    for cid in backlog_ids:
-        if cid in selected_ids:
-            e = updated[cid]
-            updated[cid] = SeenEntry(e.company, e.role, e.fit_score, e.first_seen_at, now)
+    final_store = mark_sent(reconciled_store, selected_ids, now=now_iso)
+    remaining_backlog = pending_count(final_store)
 
-    remaining_backlog = sum(1 for e in updated.values() if e.sent_at is None)
-    return updated, {**stats, "sent": len(selected), "backlog": remaining_backlog}
+    updated_seen_jobs = {cid: _dedup_entry_to_seen(entry) for cid, entry in final_store.items()}
+    return updated_seen_jobs, {**stats, "sent": len(selected_ids), "backlog": remaining_backlog}
 
 
 def make_flat_batch(prefix: str, count: int, score: int) -> list[JobRecord]:
