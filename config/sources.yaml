@@ -1,0 +1,20 @@
+# 数据源配置。每个 source 对应 fetchers/ 下一个独立 adapter（互不共享列索引常量）。
+# 铁律4：这里不放任何密钥 / 认证信息，用 GitHub Actions secrets。
+
+sources:
+  s1:
+    id: s1
+    repo: vanshb03/Summer2027-Internships
+    # 实测分支：GET /repos/vanshb03/Summer2027-Internships/branches 只返回一个分支 dev，
+    # 仓库的 default_branch 字段也是 "dev"。
+    # 陷阱：raw.githubusercontent.com 对 main/master 这类常见分支名有静默 fallback 到
+    # 默认分支的行为——curl https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/main/README.md
+    # 会返回 200，内容与 dev 分支完全一致，但这不能证明 main 分支真实存在。
+    # 用 git clone / GitHub Contents API / GraphQL 拉 main 会直接失败，因为该分支不存在。
+    # 因此这里必须显式 pin 实测到的分支名，不能假设 main/master。
+    branch: dev
+    path: README.md
+    fetch_type: markdown_table
+
+  # s2 / s3 / s4：按 CLAUDE.md「实现顺序」逐个添加。添加前必须重复上面 s1 做过的验证——
+  # 用 GitHub API 查 default_branch / 实际分支列表，不要假设是 main。
