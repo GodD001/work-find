@@ -40,8 +40,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,6 +86,24 @@ _RUN_MANIFEST_PATH = _DATA_DIR / "run_manifest.jsonl"
 _HISTORY_DIR = _DATA_DIR / "history"
 _DEFAULT_PREVIEW_PATH = Path("/tmp/preview.html")
 _DEFAULT_CAP = 80
+
+logger = logging.getLogger(__name__)
+
+
+def _write_step_summary(title: str, lines: list[str]) -> None:
+    """把关键统计追加一份到 GitHub Actions 的 $GITHUB_STEP_SUMMARY（Actions
+    页面上直接渲染成 Markdown 的那块摘要），本地跑（这个环境变量不存在）时
+    整个函数是 no-op。这是"再写一份"，不是替代 logger——logger 走的是这次
+    运行的完整时间线，summary 只留最后结果，方便在 Actions 页面上一眼看到
+    今天抓了/发了多少，不用点开日志逐行找。"""
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write(f"### {title}\n\n")
+        for line in lines:
+            f.write(f"- {line}\n")
+        f.write("\n")
 
 
 class SourceAdapter(Protocol):
@@ -128,10 +149,13 @@ def _fetch_all(
     missing: list[str] = []
     manifest_lines: list[str] = []
     for source_id, adapter in sources.items():
+        start = time.monotonic()
         try:
             raw = adapter.fetch()
             records = adapter.validate(adapter.parse(raw))
         except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+            elapsed = time.monotonic() - start
+            logger.warning("source=%s 抓取失败（%.1fs）：%s", source_id, elapsed, exc)
             missing.append(source_id)
             manifest_lines.append(
                 json.dumps(
@@ -145,6 +169,8 @@ def _fetch_all(
                 )
             )
             continue
+        elapsed = time.monotonic() - start
+        logger.info("source=%s 抓到 %d 条（%.1fs）", source_id, len(records), elapsed)
         fetched.extend(records)
     return fetched, missing, manifest_lines
 
@@ -204,11 +230,19 @@ def run_daily(
 ) -> CycleResult:
     now_iso = now.isoformat()
     selected_sources = _select_sources(only_source, sources)
+    logger.info(
+        "run_daily 开始：sources=%s dry_run=%s cap=%d", sorted(selected_sources), dry_run, cap
+    )
 
     fetched, missing_sources, source_failure_lines = _fetch_all(selected_sources, now_iso=now_iso)
 
     if missing_sources and len(missing_sources) == len(selected_sources):
         # 全部 source 失败：铁律3 + 6a 指令要求当次不写任何 seen 状态，直接退出。
+        logger.error("全部 source 失败（%s），本次运行不写任何状态", ", ".join(missing_sources))
+        _write_step_summary(
+            f"Daily {now:%Y-%m-%d} — 全部来源抓取失败",
+            [f"失败来源：{', '.join(missing_sources)}", "本次运行未写入任何状态"],
+        )
         return CycleResult(
             exit_code=1,
             outcome=None,
@@ -221,10 +255,18 @@ def run_daily(
     store = load_seen_jobs(seen_jobs_path)
     backlog_before = pending_count(store)
 
+    total_fetched = len(fetched)
     filter_result = filter_closed(fetched)
     fetched = filter_result.kept
     filtered_closed_lines = build_filtered_closed_events(
         filter_result.filtered_counts, now_iso=now_iso
+    )
+    filtered_total = sum(filter_result.filtered_counts.values())
+    logger.info(
+        "抓取合计 %d 条；过滤已关闭 %d 条；剩余 %d 条进入去重",
+        total_fetched,
+        filtered_total,
+        len(fetched),
     )
 
     merge_result = merge_duplicates(fetched, now=now_iso)
@@ -240,11 +282,13 @@ def run_daily(
     store = reconcile_result.store
     manifest_events.extend(reconcile_result.events)
     new_ids = reconcile_result.new_ids
+    logger.info("去重后 %d 条，其中新增 %d 条", len(merge_result.winners), len(new_ids))
 
     profile = load_profile(profile_path)
     jobs_by_id = {job.canonical_id: job for job in merge_result.winners}
     scores = score_new_jobs([jobs_by_id[cid] for cid in new_ids], profile)
     store = apply_fit_scores(store, scores)
+    logger.info("打分完成：%d 条新增已打分", len(scores))
 
     selected_ids = select_for_send(store, cap=cap)
 
@@ -257,9 +301,11 @@ def run_daily(
         outcome: SendOutcome | None = SendOutcome.DRY_RUN if dry_run else SendOutcome.SENT
         sent_count = 0
         backlog_count = pending_count(store)
+        logger.info("候选池为空（新增=0 且积压=0），跳过发信；仍照常写入 last_seen_at 并 commit")
     else:
         entries_to_send = [store[cid] for cid in selected_ids]
         backlog_count = pending_count(store) - len(selected_ids)
+        logger.info("选发完成：本次选中 %d 条，积压 %d 条", len(selected_ids), backlog_count)
         stats = EmailStats(
             new_count=len(new_ids),
             backlog_count=backlog_count,
@@ -283,9 +329,27 @@ def run_daily(
             smtp_client_factory=smtp_client_factory,
         )
         sent_count = len(selected_ids) if outcome is SendOutcome.SENT else 0
+        if outcome is SendOutcome.DRY_RUN:
+            logger.info(
+                "dry-run：%d 条候选已渲染，预览写入 %s（未发送邮件、未写 data/）",
+                len(selected_ids),
+                preview_path,
+            )
+        elif outcome is SendOutcome.FAILED:
+            logger.error("邮件发送失败：%d 条候选未发出，本次运行不写任何状态", len(selected_ids))
+        else:
+            logger.info("邮件发送成功：%d 条", sent_count)
 
     if outcome is SendOutcome.FAILED:
         # 铁律2: 邮件失败 -> 这次运行一条状态都不写，哪怕只是新记录的 first_seen_at。
+        _write_step_summary(
+            f"Daily {now:%Y-%m-%d} — 邮件发送失败",
+            [
+                f"本次新增 {len(new_ids)} 条待发",
+                "本次运行未写入任何状态（铁律2：邮件失败=本次运行未发生）",
+                f"缺失来源：{', '.join(missing_sources) or '无'}",
+            ],
+        )
         return CycleResult(
             exit_code=1,
             outcome=outcome,
@@ -296,6 +360,19 @@ def run_daily(
         )
 
     if outcome is SendOutcome.DRY_RUN:
+        preview_line = (
+            f"预览已写入 {preview_path}（未发送、未写 data/）"
+            if selected_ids
+            else "候选池为空，没有渲染预览"
+        )
+        _write_step_summary(
+            f"Daily {now:%Y-%m-%d} — dry-run",
+            [
+                f"本次新增 {len(new_ids)} 条",
+                preview_line,
+                f"缺失来源：{', '.join(missing_sources) or '无'}",
+            ],
+        )
         return CycleResult(
             exit_code=0,
             outcome=outcome,
@@ -318,6 +395,18 @@ def run_daily(
         f"新增{len(new_ids)} 推送{sent_count} 积压{pending_count(store)}"
     )
     _git_commit(repo_root, [seen_jobs_path, run_manifest_path, history_dir], commit_message)
+    logger.info(
+        "run_daily 完成：新增 %d 推送 %d 积压 %d", len(new_ids), sent_count, pending_count(store)
+    )
+    _write_step_summary(
+        f"Daily {now:%Y-%m-%d} — 完成",
+        [
+            f"本次新增 {len(new_ids)} 条",
+            f"本次推送 {sent_count} 条",
+            f"队列积压 {pending_count(store)} 条",
+            f"缺失来源：{', '.join(missing_sources) or '无'}",
+        ],
+    )
 
     return CycleResult(
         exit_code=0,
@@ -348,12 +437,18 @@ def run_bootstrap(
     是静默跳过或合并。
     """
     now_iso = now.isoformat()
+    logger.info("run_bootstrap 开始：dry_run=%s only_source=%s", dry_run, only_source)
     existing = load_seen_jobs(seen_jobs_path)
     if existing:
-        print(
-            f"拒绝 bootstrap：{seen_jobs_path} 已有 {len(existing)} 条记录，"
-            "bootstrap 只能在首次部署、seen_jobs.json 为空时执行一次。",
-            file=sys.stderr,
+        logger.error(
+            "拒绝 bootstrap：%s 已有 %d 条记录，bootstrap 只能在首次部署、"
+            "seen_jobs.json 为空时执行一次",
+            seen_jobs_path,
+            len(existing),
+        )
+        _write_step_summary(
+            f"Bootstrap {now:%Y-%m-%d} — 拒绝执行",
+            [f"`{seen_jobs_path}` 已有 {len(existing)} 条记录，未做任何改动"],
         )
         return CycleResult(exit_code=1, outcome=None, new_count=0, sent_count=0, backlog_count=0)
 
@@ -362,6 +457,13 @@ def run_bootstrap(
 
     if missing_sources and len(missing_sources) == len(selected_sources):
         # 全部 source 失败：跟 run_daily 一致，当次不写任何状态，直接退出。
+        logger.error(
+            "全部 source 失败（%s），本次 bootstrap 不写任何状态", ", ".join(missing_sources)
+        )
+        _write_step_summary(
+            f"Bootstrap {now:%Y-%m-%d} — 全部来源抓取失败",
+            [f"失败来源：{', '.join(missing_sources)}", "本次运行未写入任何状态"],
+        )
         return CycleResult(
             exit_code=1,
             outcome=None,
@@ -371,16 +473,33 @@ def run_bootstrap(
             missing_sources=missing_sources,
         )
 
+    total_fetched = len(fetched)
     filter_result = filter_closed(fetched)
     fetched = filter_result.kept
     filtered_closed_lines = build_filtered_closed_events(
         filter_result.filtered_counts, now_iso=now_iso
     )
+    filtered_total = sum(filter_result.filtered_counts.values())
+    logger.info(
+        "抓取合计 %d 条；过滤已关闭 %d 条；剩余 %d 条写入 bootstrap",
+        total_fetched,
+        filtered_total,
+        len(fetched),
+    )
 
     store, events = _bootstrap_store(fetched, now=now_iso)
+    logger.info("bootstrap 去重完成：写入 %d 条（sent_at=bootstrap，不打分不发信）", len(store))
 
     if dry_run:
         # --dry-run 契约：不碰 data/ 下任何文件，不 commit。
+        logger.info("dry-run：不写 data/、不 commit")
+        _write_step_summary(
+            f"Bootstrap {now:%Y-%m-%d} — dry-run",
+            [
+                f"存量共 {len(store)} 条（未写入，dry-run）",
+                f"缺失来源：{', '.join(missing_sources) or '无'}",
+            ],
+        )
         return CycleResult(
             exit_code=0,
             outcome=SendOutcome.DRY_RUN,
@@ -395,6 +514,14 @@ def run_bootstrap(
     _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
     commit_message = f"chore(data): bootstrap {now:%Y-%m-%d} — 存量 {len(store)} 条"
     _git_commit(repo_root, [seen_jobs_path, run_manifest_path], commit_message)
+    logger.info("run_bootstrap 完成：已写入并 commit（%s）", commit_message)
+    _write_step_summary(
+        f"Bootstrap {now:%Y-%m-%d} — 完成",
+        [
+            f"存量共 {len(store)} 条，sent_at=bootstrap，不发邮件",
+            f"缺失来源：{', '.join(missing_sources) or '无'}",
+        ],
+    )
 
     return CycleResult(
         exit_code=0,
@@ -481,6 +608,11 @@ def explain_scores(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 铁律4：格式里只有时间戳/级别/消息，不打印任何 env/config 快照——SMTP_*
+    # 等密钥从来不经过这里（logger 调用点里没有一处引用过它们），日志天然
+    # 不含密钥。basicConfig 默认输出到 stderr，跟 --explain-scores 的
+    # print()（stdout）不冲突，两条通道分别可独立重定向/断言。
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="python -m job_radar.daily")
     parser.add_argument(
         "--dry-run", action="store_true", help="不发邮件、不写 data/、渲染到 /tmp/preview.html"
