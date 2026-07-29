@@ -1,0 +1,27 @@
+# 求职偏好配置。
+#
+# FR-011 降级路径（ranker.py 关键词打分器）的全部关键词和权重都从这里读取，
+# 不许写死进代码（CLAUDE.md 目录结构「约束」：阈值、关键词一律走 config）。
+#
+# 打分公式：score = base_score + 命中的每个 keyword.weight 之和，
+# 最后夹到 [min_score, max_score] 区间。匹配范围是 role + company 原文
+# （大小写不敏感、子串匹配），不读 location / date_posted_raw。
+#
+# 下面这份是占位示例权重，不代表已经调好——按自己的真实偏好编辑
+# term / weight，不需要改代码。
+
+scoring:
+  base_score: 50
+  min_score: 0
+  max_score: 100
+  keywords:
+    - term: "machine learning"
+      weight: 20
+    - term: "backend"
+      weight: 15
+    - term: "software engineer"
+      weight: 10
+    - term: "data"
+      weight: 5
+    - term: "new grad"
+      weight: -15

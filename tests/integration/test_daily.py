@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from job_radar.daily import run_daily
+from job_radar.daily import explain_scores, run_daily
 from job_radar.deduplicate import load_seen_jobs
 from job_radar.emailer import SendOutcome, SmtpConfig
 from job_radar.models import Job
@@ -402,3 +402,63 @@ def test_overflow_backlog_carries_to_next_run(git_repo, profile_path):
 
     store = load_seen_jobs(git_repo / "data" / "seen_jobs.json")
     assert all(e.sent_at is not None for e in store.values())
+
+
+# ---------------------------------------------------------------------------
+# --explain-scores: pure scoring debug tool, never touches data/ or sends mail
+# ---------------------------------------------------------------------------
+
+
+def test_explain_scores_prints_table_sorted_by_score_desc(git_repo, profile_path, capsys):
+    jobs = [
+        make_job("job-low", role="PM Intern", company="LowCo"),
+        make_job("job-high", role="Senior SWE Intern", company="HighCo"),
+    ]
+    exit_code = explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert out.index("HighCo") < out.index("LowCo")  # 高分行排在低分行前面
+
+
+def test_explain_scores_shows_matched_keyword_and_weight(git_repo, profile_path, capsys):
+    jobs = [make_job("job-1", role="Senior SWE Intern", company="Acme")]
+    explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path)
+    out = capsys.readouterr().out
+    assert "swe(+10)" in out
+
+
+def test_explain_scores_never_touches_data_dir_or_git(git_repo, profile_path, capsys):
+    jobs = [make_job("job-1")]
+    before_commits = _commit_count(git_repo)
+
+    exit_code = explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path)
+
+    assert exit_code == 0
+    assert not (git_repo / "data").exists()
+    assert _commit_count(git_repo) == before_commits
+
+
+def test_explain_scores_all_sources_fail_exits_nonzero(profile_path, capsys):
+    exit_code = explain_scores(
+        sources={"s1": FakeSource(fail=RuntimeError("network down"))}, profile_path=profile_path
+    )
+    assert exit_code == 1
+
+
+def test_explain_scores_deduplicates_identical_rows_within_snapshot(profile_path, capsys):
+    """Same canonical_id fetched twice in one snapshot (S1's real Kudu
+    Dynamics duplicate-row case, CLAUDE.md 常见陷阱11) must collapse to one
+    printed line — otherwise a keyword's true hit-rate looks inflated."""
+    job = make_job("job-dup")
+    sources = {"s1": FakeSource(jobs=[job, job])}
+    exit_code = explain_scores(sources=sources, profile_path=profile_path)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    data_rows = [
+        line
+        for line in out.splitlines()
+        if line and not line.startswith("Score") and not line.startswith("-")
+    ]
+    assert len(data_rows) == 1

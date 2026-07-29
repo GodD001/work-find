@@ -56,18 +56,48 @@ def load_profile(path: Path = DEFAULT_PROFILE_PATH) -> Profile:
     )
 
 
-def score_job(job: Job, profile: Profile) -> int:
+def _matched_keywords(job: Job, profile: Profile) -> list[Keyword]:
     """role + company 原文子串匹配，大小写不敏感。不读 location /
     date_posted_raw——那两个字段是 CLAUDE.md 常见陷阱9 里明确要求原样保留、
     不做任何解析的字段，不适合拿来做子串匹配这种"理解"它们内容的操作。
     """
     haystack = f"{job.role} {job.company}".lower()
-    score = profile.base_score
-    for keyword in profile.keywords:
-        if keyword.term.lower() in haystack:
-            score += keyword.weight
-    return max(profile.min_score, min(profile.max_score, score))
+    return [kw for kw in profile.keywords if kw.term.lower() in haystack]
+
+
+def _clip(raw_score: int, profile: Profile) -> int:
+    return max(profile.min_score, min(profile.max_score, raw_score))
+
+
+def score_job(job: Job, profile: Profile) -> int:
+    raw_score = profile.base_score + sum(kw.weight for kw in _matched_keywords(job, profile))
+    return _clip(raw_score, profile)
 
 
 def score_new_jobs(jobs: list[Job], profile: Profile) -> dict[str, int]:
     return {job.canonical_id: score_job(job, profile) for job in jobs}
+
+
+@dataclass(frozen=True)
+class ScoreExplanation:
+    """--explain-scores 用：一个岗位的最终分数 + 具体命中了哪些关键词、
+    各自贡献了多少权重——用来看出 profile.yaml 里哪些关键词从没命中过
+    （权重白设）、哪些命中太广（比如 "systems" 可能匹配一半岗位）。"""
+
+    canonical_id: str
+    company: str
+    role: str
+    score: int
+    matched_keywords: list[Keyword]
+
+
+def explain_job(job: Job, profile: Profile) -> ScoreExplanation:
+    matched = _matched_keywords(job, profile)
+    raw_score = profile.base_score + sum(kw.weight for kw in matched)
+    return ScoreExplanation(
+        canonical_id=job.canonical_id,
+        company=job.company,
+        role=job.role,
+        score=_clip(raw_score, profile),
+        matched_keywords=matched,
+    )

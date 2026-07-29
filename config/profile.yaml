@@ -15,13 +15,124 @@ scoring:
   min_score: 0
   max_score: 100
   keywords:
+    # ── 强正向：AI infra / ML systems 靶心 ──
+    - term: "inference"
+      weight: 25
+    - term: "infrastructure"
+      weight: 25
+    - term: "ml ops"
+      weight: 25
+    - term: "mlops"
+      weight: 25
+    - term: "llm"
+      weight: 25
+    - term: "post-training"
+      weight: 25
+    - term: "distributed"
+      weight: 22
+    - term: "supercomputing"
+      weight: 22
+    - term: "gpu"
+      weight: 22
     - term: "machine learning"
       weight: 20
-    - term: "backend"
+    - term: "deep learning"
+      weight: 20
+    - term: "platform"
+      weight: 20
+    - term: "accelerator"
+      weight: 20
+    - term: "ai engineer"
+      weight: 20
+    - term: "ai/ml"
+      weight: 20
+    - term: "compiler"
+      weight: 18
+    - term: "systems"
       weight: 15
-    - term: "software engineer"
+    - term: "runtime"
+      weight: 15
+    - term: "cuda"
+      weight: 15
+    - term: "pytorch"
+      weight: 15
+    - term: "kubernetes"
       weight: 10
-    - term: "data"
-      weight: 5
-    - term: "new grad"
+    # ── 中性偏正：通用 SWE ──
+    - term: "software development"
+      weight: 8
+    - term: "software developer"
+      weight: 8
+    - term: "sde"
+      weight: 8
+    - term: "backend"
+      weight: 12
+    - term: "golang"
+      weight: 8
+    - term: "c++"
+      weight: 8
+    - term: "software engineer"
+      weight: 2
+    - term: "software engineering"
+      weight: 2
+    - term: "python"
+      weight: 4
+    # ── 负向：方向不符 ──
+    - term: "full stack"
       weight: -15
+    - term: "fullstack"
+      weight: -15
+    - term: "frontend"
+      weight: -20
+    - term: "front-end"
+      weight: -20
+    - term: "web"
+      weight: -12
+    - term: "desktop"
+      weight: -20
+    - term: "ios"
+      weight: -20
+    - term: "android"
+      weight: -20
+    - term: ".net"
+      weight: -15
+    - term: "c#"
+      weight: -12
+    - term: "firmware"
+      weight: -10
+    - term: "embedded"
+      weight: -8
+    - term: "game"
+      weight: -15
+    # ── 负向：非工程岗 ──
+    - term: "product management"
+      weight: -30
+    - term: "qa"
+      weight: -25
+    - term: "cybersecurity"
+      weight: -20
+    - term: "analyst"
+      weight: -25
+    - term: "ic design"
+      weight: -25
+    - term: "analog"
+      weight: -25
+    - term: "construction"
+      weight: -35
+    - term: "gtm"
+      weight: -30
+    - term: "investment"
+      weight: -25
+    - term: "marketing"
+      weight: -30
+    - term: "sales"
+      weight: -30
+    - term: "design"
+      weight: -20
+    # ── 结构性负向 ──
+    - term: "phd"
+      weight: -35
+    - term: "senior"
+      weight: -30
+    - term: "staff"
+      weight: -40

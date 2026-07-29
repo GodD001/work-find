@@ -55,7 +55,13 @@ from job_radar.emailer import EmailStats, SendOutcome, SmtpConfig
 from job_radar.emailer import send as emailer_send
 from job_radar.fetchers import vansh
 from job_radar.models import Job
-from job_radar.ranker import DEFAULT_PROFILE_PATH, load_profile, score_new_jobs
+from job_radar.ranker import (
+    DEFAULT_PROFILE_PATH,
+    ScoreExplanation,
+    explain_job,
+    load_profile,
+    score_new_jobs,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DATA_DIR = _REPO_ROOT / "data"
@@ -299,13 +305,87 @@ def run_daily(
     )
 
 
+def _format_matched_keywords(explanation: ScoreExplanation) -> str:
+    if not explanation.matched_keywords:
+        return "—"
+    return ", ".join(f"{kw.term}({kw.weight:+d})" for kw in explanation.matched_keywords)
+
+
+def _print_score_table(explanations: list[ScoreExplanation]) -> None:
+    company_width = max(7, min(24, max((len(e.company) for e in explanations), default=7)))
+    role_width = max(4, min(40, max((len(e.role) for e in explanations), default=4)))
+
+    def _truncate(text: str, width: int) -> str:
+        return text if len(text) <= width else text[: width - 1] + "…"
+
+    header = f"{'Score':>5}  {'Company':<{company_width}}  {'Role':<{role_width}}  Matched keywords"
+    print(header)
+    print("-" * len(header))
+    for e in explanations:
+        company = _truncate(e.company, company_width)
+        role = _truncate(e.role, role_width)
+        print(
+            f"{e.score:>5}  {company:<{company_width}}  {role:<{role_width}}  "
+            f"{_format_matched_keywords(e)}"
+        )
+
+
+def explain_scores(
+    *,
+    only_source: str | None = None,
+    sources: dict[str, SourceAdapter] | None = None,
+    profile_path: Path = DEFAULT_PROFILE_PATH,
+) -> int:
+    """--explain-scores: 纯打分调试工具，不接触 seen_jobs、不发信、不写
+    data/、不 commit——跟 run_daily 完全独立的一条路径，改 profile.yaml
+    之后跑一遍就能立刻看出：哪些关键词从没命中过（权重白设）、哪些命中太
+    广（比如 "systems" 可能匹配一半岗位）、高分岗位是不是真的想要的。
+
+    对本次抓到的全部岗位打分（不只是 new_ids），先跑一遍 merge_duplicates
+    去掉同一快照内的重复行（不含跨 run 的 seen_jobs 比对——纯本地快照去重），
+    避免像 CLAUDE.md 常见陷阱11 里 Kudu Dynamics 那种重复行把某个关键词的
+    命中次数印象放大三倍。
+    """
+    now_iso = datetime.now(UTC).isoformat()
+    available = sources if sources is not None else _SOURCES
+    if only_source is not None:
+        if only_source not in available:
+            raise ValueError(f"unknown source: {only_source!r} (known: {sorted(available)})")
+        selected_sources = {only_source: available[only_source]}
+    else:
+        selected_sources = dict(available)
+
+    fetched, missing_sources, _ = _fetch_all(selected_sources, now_iso=now_iso)
+    if missing_sources:
+        print(f"警告：以下来源抓取失败，结果不完整：{', '.join(missing_sources)}", file=sys.stderr)
+    if not fetched:
+        print("没有抓到任何岗位。")
+        return 1 if missing_sources else 0
+
+    winners = merge_duplicates(fetched, now=now_iso).winners
+    profile = load_profile(profile_path)
+    explanations = sorted(
+        (explain_job(job, profile) for job in winners), key=lambda e: e.score, reverse=True
+    )
+    _print_score_table(explanations)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m job_radar.daily")
     parser.add_argument(
         "--dry-run", action="store_true", help="不发邮件、不写 data/、渲染到 /tmp/preview.html"
     )
     parser.add_argument("--source", choices=sorted(_SOURCES), default=None, help="只跑一个 source")
+    parser.add_argument(
+        "--explain-scores",
+        action="store_true",
+        help="只打分不发信不写 data/，把每个岗位的分数和命中的关键词打到 stdout（调 profile 用）",
+    )
     args = parser.parse_args(argv)
+
+    if args.explain_scores:
+        return explain_scores(only_source=args.source)
 
     result = run_daily(now=datetime.now(UTC), dry_run=args.dry_run, only_source=args.source)
     return result.exit_code

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from job_radar.models import Job
 from job_radar.normalize import compute_canonical_id, row_hash
-from job_radar.ranker import Keyword, Profile, load_profile, score_job, score_new_jobs
+from job_radar.ranker import Keyword, Profile, explain_job, load_profile, score_job, score_new_jobs
 
 SOURCE_REPO = "vanshb03/Summer2027-Internships"
 
@@ -175,3 +175,47 @@ def test_score_new_jobs_returns_dict_keyed_by_canonical_id():
 def test_score_new_jobs_empty_list_returns_empty_dict():
     profile = make_profile()
     assert score_new_jobs([], profile) == {}
+
+
+# ---------------------------------------------------------------------------
+# explain_job — --explain-scores 依赖的逐关键词命中明细
+# ---------------------------------------------------------------------------
+
+
+def test_explain_job_reports_matched_keywords_with_weights():
+    job = make_job(role="Machine Learning Backend Intern")
+    profile = make_profile(
+        base_score=50,
+        keywords=[
+            Keyword(term="machine learning", weight=20),
+            Keyword(term="backend", weight=15),
+            Keyword(term="new grad", weight=-15),
+        ],
+    )
+    explanation = explain_job(job, profile)
+    assert explanation.score == 85
+    assert explanation.matched_keywords == [
+        Keyword(term="machine learning", weight=20),
+        Keyword(term="backend", weight=15),
+    ]
+    assert explanation.company == job.company
+    assert explanation.role == job.role
+    assert explanation.canonical_id == job.canonical_id
+
+
+def test_explain_job_matched_keywords_empty_when_nothing_hits():
+    job = make_job(role="PM Intern")
+    profile = make_profile(base_score=50, keywords=[Keyword(term="machine learning", weight=20)])
+    explanation = explain_job(job, profile)
+    assert explanation.matched_keywords == []
+    assert explanation.score == 50
+
+
+def test_explain_job_score_matches_score_job_including_clipping():
+    job = make_job(role="Machine Learning Backend Intern")
+    profile = make_profile(
+        base_score=90,
+        max_score=100,
+        keywords=[Keyword(term="machine learning", weight=20), Keyword(term="backend", weight=20)],
+    )
+    assert explain_job(job, profile).score == score_job(job, profile) == 100
