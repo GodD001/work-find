@@ -2,8 +2,13 @@
 
 顺序不可调换：
 
-    抓取 -> 去重 -> 打分 -> 选发 -> 发信 -> 原子写状态 -> commit
+    抓取 -> 过滤(is_closed) -> 去重 -> 打分 -> 选发 -> 发信 -> 原子写状态 -> commit
 
+- 过滤发生在去重之前（filters.py，CLAUDE.md 常见陷阱5 附近）：is_closed
+  的记录被拿掉之后 reconcile 压根不知道它存在过，不写入 seen_jobs.json、
+  不打分、不进邮件。每次运行往 run_manifest.jsonl 记一条按 source_repo
+  汇总的 filtered_closed 事件（只记数量），--explain-scores 路径同样过滤，
+  否则调 profile.yaml 权重时看到的数据和实际推送的不一致。
 - 全部 source 失败 -> 当次不写任何 seen 状态，直接退出（非零退出码）。
 - 单个 source 失败 -> 继续，邮件中通过 EmailStats.missing_sources 标明缺失来源。
 - mark_sent 当且仅当 send() 返回 SendOutcome.SENT。
@@ -54,6 +59,7 @@ from job_radar.deduplicate import (
 from job_radar.emailer import EmailStats, SendOutcome, SmtpConfig
 from job_radar.emailer import send as emailer_send
 from job_radar.fetchers import vansh
+from job_radar.filters import build_filtered_closed_events, filter_closed
 from job_radar.models import Job
 from job_radar.ranker import (
     DEFAULT_PROFILE_PATH,
@@ -203,6 +209,12 @@ def run_daily(
     store = load_seen_jobs(seen_jobs_path)
     backlog_before = pending_count(store)
 
+    filter_result = filter_closed(fetched)
+    fetched = filter_result.kept
+    filtered_closed_lines = build_filtered_closed_events(
+        filter_result.filtered_counts, now_iso=now_iso
+    )
+
     merge_result = merge_duplicates(fetched, now=now_iso)
     manifest_events: list[MergeEvent] = list(merge_result.events)
 
@@ -287,7 +299,7 @@ def run_daily(
 
     save_seen_jobs_atomic(seen_jobs_path, store)
     append_run_manifest(run_manifest_path, manifest_events)
-    _append_manifest_lines(run_manifest_path, source_failure_lines)
+    _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
     _append_job_history(history_dir, store, selected_ids, now)
     commit_message = (
         f"chore(data): daily run {now:%Y-%m-%d} — "
@@ -311,12 +323,20 @@ def _format_matched_keywords(explanation: ScoreExplanation) -> str:
     return ", ".join(f"{kw.term}({kw.weight:+d})" for kw in explanation.matched_keywords)
 
 
-def _print_score_table(explanations: list[ScoreExplanation]) -> None:
-    company_width = max(7, min(24, max((len(e.company) for e in explanations), default=7)))
-    role_width = max(4, min(40, max((len(e.role) for e in explanations), default=4)))
+def _print_score_table(explanations: list[ScoreExplanation], *, full: bool = False) -> None:
+    if full:
+        # --full: 不截断，列宽按最长的实际内容撑开，用来核对关键词到底命中
+        # 在 role 的哪个位置（截断后看不到词在哪，只能去 fixture 里 grep）。
+        company_width = max((len(e.company) for e in explanations), default=7)
+        role_width = max((len(e.role) for e in explanations), default=4)
+    else:
+        company_width = max(7, min(24, max((len(e.company) for e in explanations), default=7)))
+        role_width = max(4, min(40, max((len(e.role) for e in explanations), default=4)))
 
     def _truncate(text: str, width: int) -> str:
-        return text if len(text) <= width else text[: width - 1] + "…"
+        if full or len(text) <= width:
+            return text
+        return text[: width - 1] + "…"
 
     header = f"{'Score':>5}  {'Company':<{company_width}}  {'Role':<{role_width}}  Matched keywords"
     print(header)
@@ -335,6 +355,7 @@ def explain_scores(
     only_source: str | None = None,
     sources: dict[str, SourceAdapter] | None = None,
     profile_path: Path = DEFAULT_PROFILE_PATH,
+    full: bool = False,
 ) -> int:
     """--explain-scores: 纯打分调试工具，不接触 seen_jobs、不发信、不写
     data/、不 commit——跟 run_daily 完全独立的一条路径，改 profile.yaml
@@ -362,12 +383,17 @@ def explain_scores(
         print("没有抓到任何岗位。")
         return 1 if missing_sources else 0
 
+    fetched = filter_closed(fetched).kept  # 跟 run_daily 一致：不看已关闭岗位的分数
+    if not fetched:
+        print("没有抓到任何岗位（全部已关闭）。")
+        return 0
+
     winners = merge_duplicates(fetched, now=now_iso).winners
     profile = load_profile(profile_path)
     explanations = sorted(
         (explain_job(job, profile) for job in winners), key=lambda e: e.score, reverse=True
     )
-    _print_score_table(explanations)
+    _print_score_table(explanations, full=full)
     return 0
 
 
@@ -382,10 +408,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="只打分不发信不写 data/，把每个岗位的分数和命中的关键词打到 stdout（调 profile 用）",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="配合 --explain-scores：不截断 company/role，方便核对关键词命中在原文哪里",
+    )
     args = parser.parse_args(argv)
 
     if args.explain_scores:
-        return explain_scores(only_source=args.source)
+        return explain_scores(only_source=args.source, full=args.full)
 
     result = run_daily(now=datetime.now(UTC), dry_run=args.dry_run, only_source=args.source)
     return result.exit_code

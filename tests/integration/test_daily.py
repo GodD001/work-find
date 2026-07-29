@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from job_radar.daily import explain_scores, run_daily
+from job_radar.daily import explain_scores, main, run_daily
 from job_radar.deduplicate import load_seen_jobs
 from job_radar.emailer import SendOutcome, SmtpConfig
 from job_radar.models import Job
@@ -36,11 +36,18 @@ from job_radar.normalize import compute_canonical_id, row_hash
 SOURCE_REPO = "test-source"
 
 
-def make_job(cid: str, *, company: str = "Acme", role: str = "SWE Intern") -> Job:
+def make_job(
+    cid: str,
+    *,
+    company: str = "Acme",
+    role: str = "SWE Intern",
+    source_repo: str = SOURCE_REPO,
+    is_closed: bool = False,
+) -> Job:
     url = f"https://internal.test/{cid}"
     raw_hash = row_hash([company, role, "Remote", "Jul 1", cid])
     return Job(
-        source_repo=SOURCE_REPO,
+        source_repo=source_repo,
         company=company,
         role=role,
         location="Remote",
@@ -48,12 +55,12 @@ def make_job(cid: str, *, company: str = "Acme", role: str = "SWE Intern") -> Jo
         application_url=url,
         application_url_raw=url,
         source_job_id=None,
-        is_closed=False,
+        is_closed=is_closed,
         offers_sponsorship=None,
         requires_us_citizenship=None,
         raw_row_hash=raw_hash,
         canonical_id=compute_canonical_id(
-            source_repo=SOURCE_REPO, row_hash_value=raw_hash, application_url=url
+            source_repo=source_repo, row_hash_value=raw_hash, application_url=url
         ).value,
         canonical_id_tier="url",
     )
@@ -462,3 +469,147 @@ def test_explain_scores_deduplicates_identical_rows_within_snapshot(profile_path
         if line and not line.startswith("Score") and not line.startswith("-")
     ]
     assert len(data_rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# 过滤 is_closed：抓取解析之后、去重之前丢弃 — closed jobs never reach
+# seen_jobs.json, scoring, email, or the explain-scores table.
+# ---------------------------------------------------------------------------
+
+
+def test_run_daily_closed_jobs_never_reach_seen_jobs_or_send(git_repo, profile_path):
+    open_job = make_job("job-open")
+    closed_job = make_job("job-closed", is_closed=True)
+    sources = {"s1": FakeSource(jobs=[open_job, closed_job])}
+
+    result, sink = _run(
+        git_repo, profile_path, sources=sources, now=datetime(2026, 7, 29, tzinfo=UTC)
+    )
+
+    assert result.exit_code == 0
+    assert result.new_count == 1  # closed job never counted as new
+    assert result.sent_count == 1
+    assert len(sink) == 1
+
+    store = load_seen_jobs(git_repo / "data" / "seen_jobs.json")
+    assert set(store) == {open_job.canonical_id}
+
+
+def test_run_daily_logs_filtered_closed_summary_event_per_source_repo(git_repo, profile_path):
+    jobs = [
+        make_job("open-1", source_repo="s1-repo"),
+        make_job("closed-1", source_repo="s1-repo", is_closed=True),
+        make_job("closed-2", source_repo="s1-repo", is_closed=True),
+        make_job("closed-3", source_repo="s2-repo", is_closed=True),
+    ]
+    sources = {"s1": FakeSource(jobs=jobs)}
+
+    _run(git_repo, profile_path, sources=sources, now=datetime(2026, 7, 29, tzinfo=UTC))
+
+    manifest_path = git_repo / "data" / "run_manifest.jsonl"
+    lines = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
+    filtered_events = {e["source_repo"]: e for e in lines if e.get("event") == "filtered_closed"}
+
+    assert filtered_events["s1-repo"]["count"] == 2
+    assert filtered_events["s2-repo"]["count"] == 1
+    # 只记数量，不逐条记：不该出现 closed-1/closed-2/closed-3 这类逐条信息
+    assert "canonical_id" not in filtered_events["s1-repo"]
+
+
+def test_run_daily_no_filtered_closed_event_when_nothing_closed(git_repo, profile_path):
+    sources = {"s1": FakeSource(jobs=[make_job("job-1")])}
+    _run(git_repo, profile_path, sources=sources, now=datetime(2026, 7, 29, tzinfo=UTC))
+
+    manifest_path = git_repo / "data" / "run_manifest.jsonl"
+    if manifest_path.exists():
+        text = manifest_path.read_text(encoding="utf-8")
+        lines = [json.loads(line) for line in text.splitlines()]
+        assert not any(e.get("event") == "filtered_closed" for e in lines)
+
+
+def test_run_daily_reopened_job_after_filter_is_treated_as_brand_new(git_repo, profile_path):
+    """CLAUDE.md 新增说明的副作用：被过滤的记录不进 seen_jobs，所以上游哪天
+    撤掉 🔒 时会被当成全新岗位推送——这是想要的行为，不是 bug。"""
+    now1 = datetime(2026, 7, 28, tzinfo=UTC)
+    closed = make_job("job-reopens", is_closed=True)
+    r1, sink1 = _run(git_repo, profile_path, sources={"s1": FakeSource(jobs=[closed])}, now=now1)
+    assert r1.new_count == 0
+    assert sink1 == []
+    seen_path = git_repo / "data" / "seen_jobs.json"
+    store1 = load_seen_jobs(seen_path) if seen_path.exists() else {}
+    assert closed.canonical_id not in store1
+
+    now2 = datetime(2026, 7, 29, tzinfo=UTC)
+    reopened = make_job("job-reopens", is_closed=False)
+    r2, sink2 = _run(git_repo, profile_path, sources={"s1": FakeSource(jobs=[reopened])}, now=now2)
+    assert r2.new_count == 1
+    assert r2.sent_count == 1
+
+    store2 = load_seen_jobs(seen_path)
+    assert reopened.canonical_id in store2
+
+
+def test_explain_scores_excludes_closed_jobs(profile_path, capsys):
+    jobs = [
+        make_job("job-open", company="OpenCo"),
+        make_job("job-closed", company="ClosedCo", is_closed=True),
+    ]
+    exit_code = explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "OpenCo" in out
+    assert "ClosedCo" not in out
+
+
+# ---------------------------------------------------------------------------
+# --full: --explain-scores 默认截断长 role，加 --full 显示完整文本
+# ---------------------------------------------------------------------------
+
+LONG_ROLE = "Infrastructure Engineer Intern, Distributed Systems & GPU Runtime Platform Team"
+
+
+def test_explain_scores_truncates_long_role_by_default(profile_path, capsys):
+    assert len(LONG_ROLE) > 40  # sanity: 长于默认列宽，才有截断可测
+    jobs = [make_job("job-1", role=LONG_ROLE)]
+    explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path)
+    out = capsys.readouterr().out
+
+    assert LONG_ROLE not in out
+    assert "…" in out
+
+
+def test_explain_scores_full_shows_untruncated_role(profile_path, capsys):
+    jobs = [make_job("job-1", role=LONG_ROLE)]
+    exit_code = explain_scores(
+        sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path, full=True
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert LONG_ROLE in out
+    assert "…" not in out
+
+
+def test_explain_scores_full_does_not_affect_score_or_matched_keywords(profile_path, capsys):
+    jobs = [make_job("job-1", role=f"Senior SWE Intern, {LONG_ROLE}")]
+    explain_scores(sources={"s1": FakeSource(jobs=jobs)}, profile_path=profile_path, full=True)
+    out = capsys.readouterr().out
+    assert "swe(+10)" in out
+
+
+def test_cli_wires_full_flag_through_to_explain_scores(monkeypatch, capsys):
+    # explain_scores' profile_path default is bound at import time to the
+    # real config/profile.yaml — leave it alone here and only swap _SOURCES,
+    # since this test only cares whether --full reaches the printed table,
+    # not what the real profile scores it.
+    import job_radar.daily as daily_module
+
+    jobs = [make_job("job-1", role=LONG_ROLE)]
+    monkeypatch.setattr(daily_module, "_SOURCES", {"s1": FakeSource(jobs=jobs)})
+
+    exit_code = main(["--explain-scores", "--full"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert LONG_ROLE in out
