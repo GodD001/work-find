@@ -6,3 +6,7 @@ htmlcov/
 .venv/
 venv/
 .env
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
