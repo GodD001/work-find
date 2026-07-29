@@ -1,0 +1,124 @@
+name: daily
+
+# D-1 调度错峰（CLAUDE.md）：cron 是 UTC 时间，01:30 UTC = 09:30 北京时间。
+# weekly.yml（步骤9，尚未实现）会用 45 1 * * 6，错开 15 分钟，且共用下面
+# 同一个 concurrency group，避免 daily/weekly 并发写 data/ 产生冲突提交。
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: >-
+          D-2 首次部署：抓取全部存量写入 seen_jobs.json（sent_at=bootstrap），
+          不发邮件、不打分。只能在 seen_jobs.json 为空/不存在时跑一次，
+          否则 run_bootstrap 会直接拒绝退出，不写任何东西。
+        type: boolean
+        default: false
+      dry_run:
+        description: "不发邮件、不写 data/、不 commit/push，只在 runner 上渲染 /tmp/preview.html"
+        type: boolean
+        default: false
+
+# 两个 workflow（daily / weekly）共用同一个 group：状态都写在同一份
+# data/ 下，绝不允许并发跑，但也不允许后来的运行取消正在写状态的运行——
+# cancel-in-progress: false，宁可排队等，不可腰斩一次正在进行的原子写。
+concurrency:
+  group: job-radar-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # 陷阱6/7：第三方 action 一律 pin 完整 commit SHA，不用可变 tag。
+      # SHA 后面的 # vX.Y.Z 注释只是给人看的版本提示，不影响 pin 本身。
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.lock
+
+      # -e . 是关键的一步：CI 是全新环境，src/ 布局的包不装到 site-packages
+      # 里，python -m job_radar.daily 会 ModuleNotFoundError。--no-deps 是
+      # 因为运行时依赖已经由 requirements.lock 精确 pin 过了，这一步只是把
+      # 包本身注册进环境，不要再让它按 pyproject.toml 里的版本范围重新解析
+      # 一遍依赖（两边版本判定口径不一致的话容易装出跟 lock 文件不一样的版本）。
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+
+      - name: Configure git identity for state commits
+        run: |
+          git config user.name "job-radar-bot"
+          git config user.email "job-radar-bot@users.noreply.github.com"
+
+      # daily.py 自己在铁律2的顺序末尾做本地 git commit（不 push）。
+      # bootstrap / dry-run 都是 --bootstrap / --dry-run 两个 CLI flag，
+      # 直接透传 workflow_dispatch 的两个布尔输入；schedule 触发时
+      # inputs 上下文为空，两个比较都是 false，等价于日常正常运行。
+      #
+      # 铁律4：SMTP_APP_PASSWORD 等密钥只通过 env: 传给子进程，从不出现在
+      # run: 脚本的字面文本里、不 echo、不写进 data/——GitHub 对
+      # secrets.* 的值本身也会在日志里自动打码，这里双重保险。
+      - name: Run job-radar
+        id: run
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${{ inputs.bootstrap }}" = "true" ]; then
+            args+=(--bootstrap)
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python -m job_radar.daily "${args[@]}"
+
+      # 铁律2：push 失败 -> git pull --rebase 重试 3 次；最终失败则
+      # workflow 标红，但不回滚已经在本地提交里的 sent_at / seen_jobs
+      # 状态（邮件已经真的发出去了，回滚状态只会造成下次重发）。
+      # 只在上一步成功时才跑（默认 if 行为）：run_daily/run_bootstrap
+      # 任何失败路径都不产生 commit（要么全部 source 失败，要么邮件
+      # FAILED），没有东西可推，也不该掩盖那次失败。
+      # dry-run 场景下没有新 commit，git push 会是 no-op（"Everything
+      # up-to-date"），照样按成功处理，不需要特判。
+      - name: Push state commit (retry with rebase on conflict)
+        if: success()
+        run: |
+          set -uo pipefail
+          max_retries=3
+          attempt=0
+          while true; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "push 成功（第 $((attempt + 1)) 次尝试）"
+              exit 0
+            fi
+            if [ "$attempt" -ge "$max_retries" ]; then
+              echo "::error::git push 在 pull --rebase 重试 ${max_retries} 次后仍然失败。本次运行的状态提交（可能包含邮件已发送后的 sent_at 更新）已经落在本地，但没能推送到远程——按 CLAUDE.md 铁律2，不回滚已发送状态，需要人工介入排查冲突并手动 push。"
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            echo "push 失败，第 ${attempt}/${max_retries} 次 git pull --rebase 后重试" >&2
+            if ! git pull --rebase origin "${GITHUB_REF_NAME}"; then
+              echo "::error::git pull --rebase 失败（可能是冲突），中止重试，不再尝试 push。本地状态提交保留在 runner 上但不会被回滚；需要人工介入。"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done

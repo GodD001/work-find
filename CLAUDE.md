@@ -215,7 +215,7 @@ HTTP 超时 20s，指数退避最多 3 次。只读默认分支公开内容。
 
 ```bash
 # 环境
-uv venv && uv pip install -r requirements.lock
+uv venv && uv pip install -r requirements.lock && uv pip install -e .
 
 # 测试
 pytest tests/ -v

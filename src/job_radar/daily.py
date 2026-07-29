@@ -19,11 +19,15 @@
   完全跳过 send()，但 reconcile 产生的 last_seen_at / 新记录仍照常原子写入
   并 commit——"跳过发信"和"跳过写状态"是两件独立的事，不许合并（铁律2 的
   独立谓词精神同样适用于这里）。
+- `run_bootstrap` / `--bootstrap`（D-2）：只在 `seen_jobs.json` 为空时允许
+  跑，整份覆盖写、`sent_at` 全填 `"bootstrap"`、不打分不发信。已有内容时
+  直接拒绝退出，不做任何写入——bootstrap 是不可逆的整份覆盖，不能假设它
+  幂等。
 
 这一步只做本地编排到可运行；把它接进 GitHub Actions workflow
-（daily.yml、workflow_dispatch --dry-run、push）留给步骤 6b。这里的 commit
-只在本地仓库落一个提交，不 push——push 是有更广播达范围的操作，交给 CI
-去做更合适。
+（daily.yml、workflow_dispatch --dry-run/--bootstrap、push）留给步骤 6b。
+这里的 commit 只在本地仓库落一个提交，不 push——push 是有更广播达范围的
+操作，交给 CI 去做更合适。
 
 打分目前只有 FR-011 关键词降级路径（ranker.py）接进来了——AI 排序
 （分批调用 Claude、批失败重试）是 ranker.py 后续要补的部分，这一步之前，
@@ -55,6 +59,9 @@ from job_radar.deduplicate import (
     reconcile,
     save_seen_jobs_atomic,
     select_for_send,
+)
+from job_radar.deduplicate import (
+    bootstrap as _bootstrap_store,
 )
 from job_radar.emailer import EmailStats, SendOutcome, SmtpConfig
 from job_radar.emailer import send as emailer_send
@@ -95,6 +102,17 @@ class CycleResult:
     sent_count: int
     backlog_count: int
     missing_sources: list[str] = field(default_factory=list)
+
+
+def _select_sources(
+    only_source: str | None, sources: dict[str, SourceAdapter] | None
+) -> dict[str, SourceAdapter]:
+    pool = sources if sources is not None else _SOURCES
+    if only_source is None:
+        return dict(pool)
+    if only_source not in pool:
+        raise ValueError(f"unknown source: {only_source!r} (known: {sorted(pool)})")
+    return {only_source: pool[only_source]}
 
 
 def _fetch_all(
@@ -185,13 +203,7 @@ def run_daily(
     preview_path: Path = _DEFAULT_PREVIEW_PATH,
 ) -> CycleResult:
     now_iso = now.isoformat()
-    available = sources if sources is not None else _SOURCES
-    if only_source is not None:
-        if only_source not in available:
-            raise ValueError(f"unknown source: {only_source!r} (known: {sorted(available)})")
-        selected_sources = {only_source: available[only_source]}
-    else:
-        selected_sources = dict(available)
+    selected_sources = _select_sources(only_source, sources)
 
     fetched, missing_sources, source_failure_lines = _fetch_all(selected_sources, now_iso=now_iso)
 
@@ -317,6 +329,83 @@ def run_daily(
     )
 
 
+def run_bootstrap(
+    *,
+    now: datetime,
+    dry_run: bool = False,
+    only_source: str | None = None,
+    sources: dict[str, SourceAdapter] | None = None,
+    seen_jobs_path: Path = _SEEN_JOBS_PATH,
+    run_manifest_path: Path = _RUN_MANIFEST_PATH,
+    repo_root: Path = _REPO_ROOT,
+) -> CycleResult:
+    """D-2 bootstrap：抓取全部存量，整份写入 seen_jobs.json，`sent_at` 全部
+    填 `"bootstrap"`，不打分、不发邮件（CLAUDE.md D-2）。
+
+    只能在首次部署、`seen_jobs.json` 为空/不存在时跑：这是整份覆盖写，不是
+    合并写，第二次误跑会把已经真实发送过的 `sent_at` 状态连同去重历史全部
+    冲掉——不能靠"反正 bootstrap 幂等"这种假设放行，所以这里显式拒绝而不
+    是静默跳过或合并。
+    """
+    now_iso = now.isoformat()
+    existing = load_seen_jobs(seen_jobs_path)
+    if existing:
+        print(
+            f"拒绝 bootstrap：{seen_jobs_path} 已有 {len(existing)} 条记录，"
+            "bootstrap 只能在首次部署、seen_jobs.json 为空时执行一次。",
+            file=sys.stderr,
+        )
+        return CycleResult(exit_code=1, outcome=None, new_count=0, sent_count=0, backlog_count=0)
+
+    selected_sources = _select_sources(only_source, sources)
+    fetched, missing_sources, source_failure_lines = _fetch_all(selected_sources, now_iso=now_iso)
+
+    if missing_sources and len(missing_sources) == len(selected_sources):
+        # 全部 source 失败：跟 run_daily 一致，当次不写任何状态，直接退出。
+        return CycleResult(
+            exit_code=1,
+            outcome=None,
+            new_count=0,
+            sent_count=0,
+            backlog_count=0,
+            missing_sources=missing_sources,
+        )
+
+    filter_result = filter_closed(fetched)
+    fetched = filter_result.kept
+    filtered_closed_lines = build_filtered_closed_events(
+        filter_result.filtered_counts, now_iso=now_iso
+    )
+
+    store, events = _bootstrap_store(fetched, now=now_iso)
+
+    if dry_run:
+        # --dry-run 契约：不碰 data/ 下任何文件，不 commit。
+        return CycleResult(
+            exit_code=0,
+            outcome=SendOutcome.DRY_RUN,
+            new_count=len(store),
+            sent_count=0,
+            backlog_count=0,
+            missing_sources=missing_sources,
+        )
+
+    save_seen_jobs_atomic(seen_jobs_path, store)
+    append_run_manifest(run_manifest_path, events)
+    _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
+    commit_message = f"chore(data): bootstrap {now:%Y-%m-%d} — 存量 {len(store)} 条"
+    _git_commit(repo_root, [seen_jobs_path, run_manifest_path], commit_message)
+
+    return CycleResult(
+        exit_code=0,
+        outcome=None,
+        new_count=len(store),
+        sent_count=0,
+        backlog_count=0,
+        missing_sources=missing_sources,
+    )
+
+
 def _format_matched_keywords(explanation: ScoreExplanation) -> str:
     if not explanation.matched_keywords:
         return "—"
@@ -368,13 +457,7 @@ def explain_scores(
     命中次数印象放大三倍。
     """
     now_iso = datetime.now(UTC).isoformat()
-    available = sources if sources is not None else _SOURCES
-    if only_source is not None:
-        if only_source not in available:
-            raise ValueError(f"unknown source: {only_source!r} (known: {sorted(available)})")
-        selected_sources = {only_source: available[only_source]}
-    else:
-        selected_sources = dict(available)
+    selected_sources = _select_sources(only_source, sources)
 
     fetched, missing_sources, _ = _fetch_all(selected_sources, now_iso=now_iso)
     if missing_sources:
@@ -413,10 +496,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="配合 --explain-scores：不截断 company/role，方便核对关键词命中在原文哪里",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="D-2 首次部署：抓取全部存量写入 seen_jobs.json（sent_at=bootstrap），不发邮件、"
+        "不打分。只能在 seen_jobs.json 为空时跑一次",
+    )
     args = parser.parse_args(argv)
 
     if args.explain_scores:
         return explain_scores(only_source=args.source, full=args.full)
+
+    if args.bootstrap:
+        result = run_bootstrap(now=datetime.now(UTC), dry_run=args.dry_run, only_source=args.source)
+        return result.exit_code
 
     result = run_daily(now=datetime.now(UTC), dry_run=args.dry_run, only_source=args.source)
     return result.exit_code
