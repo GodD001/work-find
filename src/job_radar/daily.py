@@ -340,80 +340,84 @@ def run_daily(
         else:
             logger.info("邮件发送成功：%d 条", sent_count)
 
+    # 下面统一收口：不管 FAILED / DRY_RUN / SENT 哪条路径，都在这一处算出
+    # exit_code / summary_title / summary_lines / final_backlog，只有一个
+    # _write_step_summary 调用点和一个 return。这是特意的——之前 FAILED /
+    # DRY_RUN 各自提前 return、各自手写一份 summary 行，DRY_RUN 那份漏掉了
+    # 推送/积压两个数字（早退分支绕开了"完成"分支才有的统一构造），根因是
+    # 分叉的构造代码，不是漏了某一行；收口成一处之后，以后再加一个字段
+    # （比如这次的"过滤已关闭"）只需要改一个地方，三条路径同步生效。
+    missing_line = f"缺失来源：{', '.join(missing_sources) or '无'}"
+
     if outcome is SendOutcome.FAILED:
         # 铁律2: 邮件失败 -> 这次运行一条状态都不写，哪怕只是新记录的 first_seen_at。
-        _write_step_summary(
-            f"Daily {now:%Y-%m-%d} — 邮件发送失败",
-            [
-                f"本次新增 {len(new_ids)} 条待发",
-                "本次运行未写入任何状态（铁律2：邮件失败=本次运行未发生）",
-                f"缺失来源：{', '.join(missing_sources) or '无'}",
-            ],
-        )
-        return CycleResult(
-            exit_code=1,
-            outcome=outcome,
-            new_count=len(new_ids),
-            sent_count=0,
-            backlog_count=backlog_before,
-            missing_sources=missing_sources,
-        )
-
-    if outcome is SendOutcome.DRY_RUN:
+        exit_code = 1
+        final_backlog = backlog_before
+        summary_title = f"Daily {now:%Y-%m-%d} — 邮件发送失败"
+        summary_lines = [
+            f"抓取合计 {total_fetched} 条，过滤已关闭 {filtered_total} 条",
+            f"本次新增 {len(new_ids)} 条",
+            f"本次待发 {len(selected_ids)} 条（发送失败，未发出）",
+            f"队列积压 {backlog_count} 条（未变化——本次运行未写入任何状态，铁律2）",
+            missing_line,
+        ]
+    elif outcome is SendOutcome.DRY_RUN:
+        exit_code = 0
+        final_backlog = backlog_before
         preview_line = (
             f"预览已写入 {preview_path}（未发送、未写 data/）"
             if selected_ids
             else "候选池为空，没有渲染预览"
         )
-        _write_step_summary(
-            f"Daily {now:%Y-%m-%d} — dry-run",
-            [
-                f"本次新增 {len(new_ids)} 条",
-                preview_line,
-                f"缺失来源：{', '.join(missing_sources) or '无'}",
-            ],
+        summary_title = f"Daily {now:%Y-%m-%d} — dry-run"
+        summary_lines = [
+            f"抓取合计 {total_fetched} 条，过滤已关闭 {filtered_total} 条",
+            f"本次新增 {len(new_ids)} 条",
+            f"本次将推送 {len(selected_ids)} 条",
+            f"队列将积压 {backlog_count} 条",
+            preview_line,
+            missing_line,
+        ]
+    else:
+        # outcome is SendOutcome.SENT (真正发出，或候选池为空的"无需发送"情形)
+        if selected_ids:
+            store = mark_sent(store, selected_ids, now=now_iso)
+
+        save_seen_jobs_atomic(seen_jobs_path, store)
+        append_run_manifest(run_manifest_path, manifest_events)
+        _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
+        _append_job_history(history_dir, store, selected_ids, now)
+        commit_message = (
+            f"chore(data): daily run {now:%Y-%m-%d} — "
+            f"新增{len(new_ids)} 推送{sent_count} 积压{pending_count(store)}"
         )
-        return CycleResult(
-            exit_code=0,
-            outcome=outcome,
-            new_count=len(new_ids),
-            sent_count=0,
-            backlog_count=backlog_before,
-            missing_sources=missing_sources,
+        _git_commit(repo_root, [seen_jobs_path, run_manifest_path, history_dir], commit_message)
+        logger.info(
+            "run_daily 完成：新增 %d 推送 %d 积压 %d",
+            len(new_ids),
+            sent_count,
+            pending_count(store),
         )
 
-    # outcome is SendOutcome.SENT (真正发出，或候选池为空的"无需发送"情形)
-    if selected_ids:
-        store = mark_sent(store, selected_ids, now=now_iso)
-
-    save_seen_jobs_atomic(seen_jobs_path, store)
-    append_run_manifest(run_manifest_path, manifest_events)
-    _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
-    _append_job_history(history_dir, store, selected_ids, now)
-    commit_message = (
-        f"chore(data): daily run {now:%Y-%m-%d} — "
-        f"新增{len(new_ids)} 推送{sent_count} 积压{pending_count(store)}"
-    )
-    _git_commit(repo_root, [seen_jobs_path, run_manifest_path, history_dir], commit_message)
-    logger.info(
-        "run_daily 完成：新增 %d 推送 %d 积压 %d", len(new_ids), sent_count, pending_count(store)
-    )
-    _write_step_summary(
-        f"Daily {now:%Y-%m-%d} — 完成",
-        [
+        exit_code = 0
+        final_backlog = pending_count(store)
+        summary_title = f"Daily {now:%Y-%m-%d} — 完成"
+        summary_lines = [
+            f"抓取合计 {total_fetched} 条，过滤已关闭 {filtered_total} 条",
             f"本次新增 {len(new_ids)} 条",
             f"本次推送 {sent_count} 条",
-            f"队列积压 {pending_count(store)} 条",
-            f"缺失来源：{', '.join(missing_sources) or '无'}",
-        ],
-    )
+            f"队列积压 {final_backlog} 条",
+            missing_line,
+        ]
+
+    _write_step_summary(summary_title, summary_lines)
 
     return CycleResult(
-        exit_code=0,
+        exit_code=exit_code,
         outcome=outcome,
         new_count=len(new_ids),
         sent_count=sent_count,
-        backlog_count=pending_count(store),
+        backlog_count=final_backlog,
         missing_sources=missing_sources,
     )
 
@@ -490,42 +494,38 @@ def run_bootstrap(
     store, events = _bootstrap_store(fetched, now=now_iso)
     logger.info("bootstrap 去重完成：写入 %d 条（sent_at=bootstrap，不打分不发信）", len(store))
 
+    # 跟 run_daily 同样的收口：dry-run / 真正写入两条路径共用同一个
+    # _write_step_summary 调用，只有"是否真的落盘+commit"和标题/状态行不同，
+    # 避免两份摘要各写各的、其中一份漏字段还没人发现。
     if dry_run:
         # --dry-run 契约：不碰 data/ 下任何文件，不 commit。
         logger.info("dry-run：不写 data/、不 commit")
-        _write_step_summary(
-            f"Bootstrap {now:%Y-%m-%d} — dry-run",
-            [
-                f"存量共 {len(store)} 条（未写入，dry-run）",
-                f"缺失来源：{', '.join(missing_sources) or '无'}",
-            ],
-        )
-        return CycleResult(
-            exit_code=0,
-            outcome=SendOutcome.DRY_RUN,
-            new_count=len(store),
-            sent_count=0,
-            backlog_count=0,
-            missing_sources=missing_sources,
-        )
+        outcome: SendOutcome | None = SendOutcome.DRY_RUN
+        summary_title = f"Bootstrap {now:%Y-%m-%d} — dry-run"
+        state_line = f"存量共 {len(store)} 条（未写入，dry-run）"
+    else:
+        save_seen_jobs_atomic(seen_jobs_path, store)
+        append_run_manifest(run_manifest_path, events)
+        _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
+        commit_message = f"chore(data): bootstrap {now:%Y-%m-%d} — 存量 {len(store)} 条"
+        _git_commit(repo_root, [seen_jobs_path, run_manifest_path], commit_message)
+        logger.info("run_bootstrap 完成：已写入并 commit（%s）", commit_message)
+        outcome = None
+        summary_title = f"Bootstrap {now:%Y-%m-%d} — 完成"
+        state_line = f"存量共 {len(store)} 条，sent_at=bootstrap，不发邮件"
 
-    save_seen_jobs_atomic(seen_jobs_path, store)
-    append_run_manifest(run_manifest_path, events)
-    _append_manifest_lines(run_manifest_path, source_failure_lines + filtered_closed_lines)
-    commit_message = f"chore(data): bootstrap {now:%Y-%m-%d} — 存量 {len(store)} 条"
-    _git_commit(repo_root, [seen_jobs_path, run_manifest_path], commit_message)
-    logger.info("run_bootstrap 完成：已写入并 commit（%s）", commit_message)
     _write_step_summary(
-        f"Bootstrap {now:%Y-%m-%d} — 完成",
+        summary_title,
         [
-            f"存量共 {len(store)} 条，sent_at=bootstrap，不发邮件",
+            f"抓取合计 {total_fetched} 条，过滤已关闭 {filtered_total} 条",
+            state_line,
             f"缺失来源：{', '.join(missing_sources) or '无'}",
         ],
     )
 
     return CycleResult(
         exit_code=0,
-        outcome=None,
+        outcome=outcome,
         new_count=len(store),
         sent_count=0,
         backlog_count=0,
