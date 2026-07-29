@@ -19,6 +19,13 @@ on:
         description: "不发邮件、不写 data/、不 commit/push，只在 runner 上渲染 /tmp/preview.html"
         type: boolean
         default: false
+      force_email:
+        description: >-
+          发信链路验证：不看待发池，强制走一次真实 send() 发一封确认邮件
+          （不写 data/、不 commit、不改任何 sent_at）。用于验证 SMTP
+          凭据 / GitHub Secrets 注入这条从未被真实运行过的链路是否可用。
+        type: boolean
+        default: false
 
 # 两个 workflow（daily / weekly）共用同一个 group：状态都写在同一份
 # data/ 下，绝不允许并发跑，但也不允许后来的运行取消正在写状态的运行——
@@ -65,9 +72,11 @@ jobs:
           git config user.email "job-radar-bot@users.noreply.github.com"
 
       # daily.py 自己在铁律2的顺序末尾做本地 git commit（不 push）。
-      # bootstrap / dry-run 都是 --bootstrap / --dry-run 两个 CLI flag，
-      # 直接透传 workflow_dispatch 的两个布尔输入；schedule 触发时
-      # inputs 上下文为空，两个比较都是 false，等价于日常正常运行。
+      # bootstrap / dry-run / force-email 都是各自同名的 CLI flag，
+      # 直接透传 workflow_dispatch 的三个布尔输入；schedule 触发时
+      # inputs 上下文为空，三个比较都是 false，等价于日常正常运行。
+      # force_email 是链路验证专用开关，跟 bootstrap 语义上互斥（daily.py
+      # 按 --force-email 优先于 --bootstrap 分派），不会同时生效。
       #
       # 铁律4：SMTP_APP_PASSWORD 等密钥只通过 env: 传给子进程，从不出现在
       # run: 脚本的字面文本里、不 echo、不写进 data/——GitHub 对
@@ -88,6 +97,9 @@ jobs:
           fi
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
+          fi
+          if [ "${{ inputs.force_email }}" = "true" ]; then
+            args+=(--force-email)
           fi
           python -m job_radar.daily "${args[@]}"
 

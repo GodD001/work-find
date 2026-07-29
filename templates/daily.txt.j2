@@ -9,6 +9,9 @@ AI 职位雷达 · {{ now.strftime('%Y-%m-%d') }}
 {% if stats.ai_ranking_unavailable %}
 ⚠️ AI 排序不可用，本次为关键词打分（降级路径，见 CLAUDE.md AI 调用约束）
 {% endif %}
+{% if stats.force_email_check %}
+🧪 本邮件由 --force-email 触发，仅用于验证发信链路是否可用——下面不是真实职位数据
+{% endif %}
 本次新增 {{ stats.new_count }} ／ 本次推送 {{ sent_count }} ／ 队列积压 {{ stats.backlog_count }}
 {% if stats.missing_sources %}
 以下来源本次抓取失败，结果可能不完整：{{ stats.missing_sources | join('、') }}

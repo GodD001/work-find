@@ -93,6 +93,10 @@ class EmailStats:
     backlog_count: int
     missing_sources: list[str] = field(default_factory=list)
     ai_ranking_unavailable: bool = False
+    # daily.py run_force_email: this send carries one synthetic placeholder
+    # entry, not real job data — the template banners that plainly so the
+    # recipient never mistakes it for a real digest.
+    force_email_check: bool = False
 
 
 @dataclass(frozen=True)

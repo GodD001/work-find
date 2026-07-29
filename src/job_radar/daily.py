@@ -52,6 +52,7 @@ from typing import Protocol
 
 from job_radar.deduplicate import (
     MergeEvent,
+    SeenJobEntry,
     SeenStore,
     append_run_manifest,
     apply_fit_scores,
@@ -533,6 +534,122 @@ def run_bootstrap(
     )
 
 
+_FORCE_EMAIL_CANONICAL_ID = "__force_email_check__"
+
+
+def run_force_email(
+    *,
+    now: datetime,
+    dry_run: bool = False,
+    seen_jobs_path: Path = _SEEN_JOBS_PATH,
+    smtp_config: SmtpConfig | None = None,
+    smtp_client_factory=None,
+    preview_path: Path = _DEFAULT_PREVIEW_PATH,
+) -> CycleResult:
+    """发信链路验证：不抓取、不去重、不打分、不写任何状态——只借用
+    emailer.py 真实的 send() 路径发一封确认邮件。
+
+    背景：daily.py 部署以来只成功跑过一次 bootstrap（待发池当次全部标
+    `sent_at="bootstrap"`），日常 cron 还没有在待发池非空的情况下触发过
+    send()——SMTP 凭据、GitHub Secrets 注入、SendOutcome 判定这条链路
+    一次都没有被真实验证过。
+
+    emailer.send() 对空 entries 直接短路返回 SENT、完全不联系 SMTP
+    （见 emailer.py 模块注释：D-2 不发全零邮件），所以要真正验证这条链路
+    必须传至少一条 entry；这里构造的是一个明确标注"非真实职位"的合成
+    占位记录，只存在于这次调用的内存里，从不写入 seen_jobs.json /
+    job_history.jsonl、不参与去重/排序——不与铁律1"不许编造职位事实"
+    冲突，因为它从未被当成职位数据持久化或展示为真实抓取结果。
+
+    `backlog_count` 读的是当前真实 seen_jobs.json 的积压数（只读一次，
+    从不写回），让邮件正文如实反映"验证时刻真实的待发池状态"，而不是
+    硬编码一个 0。
+    """
+    now_iso = now.isoformat()
+    store = load_seen_jobs(seen_jobs_path)
+    real_backlog = pending_count(store)
+    logger.info("run_force_email 开始：dry_run=%s 当前真实积压=%d", dry_run, real_backlog)
+
+    placeholder = SeenJobEntry(
+        canonical_id=_FORCE_EMAIL_CANONICAL_ID,
+        canonical_id_tier="hash_fallback",
+        source_repo="__force_email_check__",
+        company="[链路验证 — 非真实职位]",
+        role="由 --force-email 生成，仅用于确认 SMTP 发信链路可用",
+        location="—",
+        date_posted_raw="—",
+        fallback_key=None,
+        merged_ids=[],
+        merged_row_count=1,
+        fit_score=None,
+        first_seen_at=now_iso,
+        last_seen_at=now_iso,
+        sent_at=None,
+        application_url=None,
+        is_closed=False,
+    )
+
+    stats = EmailStats(
+        new_count=0,
+        backlog_count=real_backlog,
+        missing_sources=[],
+        force_email_check=True,
+    )
+
+    effective_smtp_config = smtp_config
+    if effective_smtp_config is None:
+        effective_smtp_config = (
+            SmtpConfig.from_env()
+            if not dry_run
+            else SmtpConfig(host="", port=0, user="", mail_to="", app_password="")
+        )
+
+    outcome = emailer_send(
+        [placeholder],
+        stats=stats,
+        now=now,
+        smtp_config=effective_smtp_config,
+        dry_run=dry_run,
+        preview_path=preview_path,
+        smtp_client_factory=smtp_client_factory,
+    )
+
+    if outcome is SendOutcome.FAILED:
+        logger.error("--force-email：发信链路验证失败（SendOutcome.FAILED），未写入任何状态")
+        exit_code = 1
+        summary_title = f"Force-email {now:%Y-%m-%d} — 链路验证失败"
+        summary_lines = [
+            f"真实待发积压 {real_backlog} 条（本次未受影响）",
+            "SMTP 发送失败，见运行日志",
+        ]
+    elif outcome is SendOutcome.DRY_RUN:
+        logger.info("--force-email --dry-run：预览已写入 %s，未联系 SMTP", preview_path)
+        exit_code = 0
+        summary_title = f"Force-email {now:%Y-%m-%d} — dry-run"
+        summary_lines = [
+            f"真实待发积压 {real_backlog} 条",
+            f"预览已写入 {preview_path}（未联系 SMTP）",
+        ]
+    else:
+        logger.info("--force-email：链路验证邮件已发出")
+        exit_code = 0
+        summary_title = f"Force-email {now:%Y-%m-%d} — 完成"
+        summary_lines = [
+            f"真实待发积压 {real_backlog} 条（本次未受影响）",
+            "验证邮件已发出，未写入任何状态",
+        ]
+
+    _write_step_summary(summary_title, summary_lines)
+
+    return CycleResult(
+        exit_code=exit_code,
+        outcome=outcome,
+        new_count=0,
+        sent_count=1 if outcome is SendOutcome.SENT else 0,
+        backlog_count=real_backlog,
+    )
+
+
 def _format_matched_keywords(explanation: ScoreExplanation) -> str:
     if not explanation.matched_keywords:
         return "—"
@@ -634,10 +751,21 @@ def main(argv: list[str] | None = None) -> int:
         help="D-2 首次部署：抓取全部存量写入 seen_jobs.json（sent_at=bootstrap），不发邮件、"
         "不打分。只能在 seen_jobs.json 为空时跑一次",
     )
+    parser.add_argument(
+        "--force-email",
+        action="store_true",
+        help="发信链路验证：不看待发池，强制走一次真实 emailer.send() 发一封确认邮件。"
+        "不写 data/、不 commit、不改任何 sent_at——只用来验证 SMTP 凭据/Secrets 注入是否正常。"
+        "配合 --dry-run 只渲染预览、不联系 SMTP",
+    )
     args = parser.parse_args(argv)
 
     if args.explain_scores:
         return explain_scores(only_source=args.source, full=args.full)
+
+    if args.force_email:
+        result = run_force_email(now=datetime.now(UTC), dry_run=args.dry_run)
+        return result.exit_code
 
     if args.bootstrap:
         result = run_bootstrap(now=datetime.now(UTC), dry_run=args.dry_run, only_source=args.source)

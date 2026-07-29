@@ -26,6 +26,12 @@
   </p>
   {% endif %}
 
+  {% if stats.force_email_check %}
+  <p style="background:#fef9c3;border:1px solid #ca8a04;padding:10px;font-weight:bold;">
+    🧪 本邮件由 --force-email 触发，仅用于验证发信链路是否可用——下表不是真实职位数据
+  </p>
+  {% endif %}
+
   <p>
     本次新增 {{ stats.new_count }} ／
     本次推送 {{ sent_count }} ／
